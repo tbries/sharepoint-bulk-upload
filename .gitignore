@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Runtime logs
+*.log
+
+# Upload ledger (generated per-folder by sp-upload.sh)
+.sp-upload-ledger
+
+# Test data (sample files for local testing)
+test-data/
