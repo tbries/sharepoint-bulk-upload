@@ -7,9 +7,10 @@ set -euo pipefail
 # Constants
 ###############################################################################
 readonly GRAPH_BASE="https://graph.microsoft.com/v1.0"
-readonly CHUNK_SIZE=$((10 * 1024 * 1024))       # 10 MiB per chunk
 readonly SMALL_FILE_LIMIT=$((4 * 1024 * 1024))  # 4 MB threshold
 readonly TOKEN_TTL=2700                          # Refresh token every 45 min
+readonly MIN_CHUNK_SIZE=$((320 * 1024))          # 320 KiB — Graph API minimum
+readonly MAX_CHUNK_SIZE=$((60 * 1024 * 1024))    # 60 MiB  — Graph API maximum
 
 ###############################################################################
 # Global state
@@ -18,6 +19,7 @@ SOURCE=""
 SITE_URL=""
 LIBRARY=""
 REMOTE_PATH=""
+CHUNK_SIZE=$((10 * 1024 * 1024))  # default 10 MiB per chunk
 DRY_RUN=false
 LOG_FILE=""
 LEDGER_FILE=""
@@ -58,6 +60,9 @@ Required:
 
 Optional:
   --remote-path <path>  Sub-path inside the library (default: library root)
+  --chunk-size <bytes>  Upload chunk size in bytes (default: 10485760 / 10 MiB)
+                        Min: 327680 (320 KiB), Max: 62914560 (60 MiB)
+                        Must be a multiple of 327680 (320 KiB)
   --dry-run             Preview operations without executing
   --log <path>          Log file (default: ./sp-upload.log)
   --ledger <path>       Ledger file for resume tracking
@@ -100,6 +105,7 @@ parse_args() {
       --site-url)    SITE_URL="$2";    shift 2 ;;
       --library)     LIBRARY="$2";     shift 2 ;;
       --remote-path) REMOTE_PATH="$2"; shift 2 ;;
+      --chunk-size)  CHUNK_SIZE="$2";  shift 2 ;;
       --dry-run)     DRY_RUN=true;     shift   ;;
       --log)         LOG_FILE="$2";    shift 2 ;;
       --ledger)      LEDGER_FILE="$2"; shift 2 ;;
@@ -115,6 +121,20 @@ parse_args() {
   SOURCE="$(cd "$SOURCE" && pwd)"
   [[ -z "$LOG_FILE" ]]    && LOG_FILE="./sp-upload.log"
   [[ -z "$LEDGER_FILE" ]] && LEDGER_FILE="${SOURCE}/.sp-upload-ledger"
+
+  # Validate chunk size
+  if ! [[ "$CHUNK_SIZE" =~ ^[0-9]+$ ]]; then
+    die "--chunk-size must be a positive integer (bytes), got: $CHUNK_SIZE"
+  fi
+  if (( CHUNK_SIZE < MIN_CHUNK_SIZE )); then
+    die "--chunk-size must be at least $MIN_CHUNK_SIZE bytes (320 KiB), got: $CHUNK_SIZE"
+  fi
+  if (( CHUNK_SIZE > MAX_CHUNK_SIZE )); then
+    die "--chunk-size must be at most $MAX_CHUNK_SIZE bytes (60 MiB), got: $CHUNK_SIZE"
+  fi
+  if (( CHUNK_SIZE % MIN_CHUNK_SIZE != 0 )); then
+    die "--chunk-size must be a multiple of $MIN_CHUNK_SIZE bytes (320 KiB), got: $CHUNK_SIZE"
+  fi
 }
 
 ###############################################################################
@@ -509,6 +529,7 @@ main() {
   log "  Library     : $LIBRARY"
   log "  Remote path : ${REMOTE_PATH:-(root)}"
   log "  Ledger      : $LEDGER_FILE"
+  log "  Chunk size  : $(human_size $CHUNK_SIZE)"
   log "  Dry-run     : $DRY_RUN"
   if [[ -n "${DRIVE_ID:-}" ]]; then
     log "  Drive ID    : $DRIVE_ID"

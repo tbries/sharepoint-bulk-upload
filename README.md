@@ -46,6 +46,7 @@ az login
   --site-url <url> \
   --library <name> \
   [--remote-path <path>] \
+  [--chunk-size <bytes>] \
   [--dry-run] \
   [--log <path>] \
   [--ledger <path>]
@@ -59,6 +60,7 @@ az login
 | `--site-url <url>` | ✅ | SharePoint site URL |
 | `--library <name>` | ✅ | Target document library (e.g. `Shared Documents`) |
 | `--remote-path <path>` | | Sub-path inside the library (default: root) |
+| `--chunk-size <bytes>` | | Upload chunk size in bytes (default: `10485760` / 10 MiB). Min: `327680` (320 KiB), Max: `62914560` (60 MiB). Must be a multiple of `327680` (320 KiB). See [Chunk Size](#chunk-size) below. |
 | `--dry-run` | | Preview operations without executing |
 | `--log <path>` | | Log file path (default: `./sp-upload.log`) |
 | `--ledger <path>` | | Ledger file for resume tracking (default: `<source>/.sp-upload-ledger`) |
@@ -93,7 +95,27 @@ Upload into a sub-folder with dry-run:
 3. Walks the local folder tree and mirrors it on SharePoint
 4. Uploads each file:
    - **< 4 MB**: simple `PUT` to Graph API
-   - **≥ 4 MB**: creates an upload session, then uploads in 10 MiB chunks
+   - **≥ 4 MB**: creates an upload session, then uploads in chunks (default 10 MiB)
+
+## Chunk Size
+
+The `--chunk-size` flag controls how large each HTTP request body is during
+chunked uploads (files ≥ 4 MB). The value is specified in **bytes** and must
+satisfy the [Microsoft Graph upload session requirements](https://learn.microsoft.com/en-us/graph/api/driveitem-createuploadsession):
+
+| Constraint | Value |
+|---|---|
+| **Minimum** | `327680` (320 KiB) |
+| **Maximum** | `62914560` (60 MiB) |
+| **Alignment** | Must be a multiple of `327680` (320 KiB) |
+| **Default** | `10485760` (10 MiB) |
+
+**Choosing a chunk size:**
+
+- **Slower / unstable connections** — use a smaller value (e.g. `--chunk-size 3276800`
+  for ~3 MiB) so individual retries are cheaper.
+- **Fast connections with large files** — increase up to the 60 MiB maximum
+  (e.g. `--chunk-size 62914560`) to reduce the number of HTTP round-trips.
 5. Records each successful upload in a ledger file
 
 ## Resume / Retry Behavior
@@ -116,7 +138,7 @@ Delete the ledger file to force a full re-upload.
 | `Not logged in` | Run `az login` — opens browser for sign-in |
 | `jq not found` | Install with `brew install jq` |
 | `Library not found` | Check the exact library name (case-sensitive). The error message lists available libraries. |
-| Large file upload fails | Ensure stable network; the script uses 10 MiB chunks and cancels the session on failure — re-run to retry |
+| Large file upload fails | Ensure stable network; the script uses chunked uploads (10 MiB default) and cancels the session on failure — re-run to retry. Consider `--chunk-size` to lower chunk size on flaky connections. |
 | Permission denied (403) | Your account needs write access to the target document library |
 | Token expired during upload | The script refreshes tokens automatically every 45 minutes |
 
