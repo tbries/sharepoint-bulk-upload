@@ -13,6 +13,8 @@ own identity (browser sign-in, MFA supported).
 - **Large-file support** — files ≥ 4 MB use chunked upload sessions (10 MiB chunks)
 - **Resume/retry** — SHA-256 ledger tracks uploads; re-running skips unchanged
   files and retries failures
+- **Throttle handling** — automatic exponential backoff on HTTP 429 / 503 with
+  `Retry-After` header support; aborts gracefully after 5 retries
 - **Dry-run mode** — preview what would happen without touching SharePoint
 - Zero dependencies beyond Bash, Azure CLI, curl, and jq
 
@@ -139,6 +141,7 @@ Delete the ledger file to force a full re-upload.
 | `jq not found` | Install with `brew install jq` |
 | `Library not found` | Check the exact library name (case-sensitive). The error message lists available libraries. |
 | Large file upload fails | Ensure stable network; the script uses chunked uploads (10 MiB default) and cancels the session on failure — re-run to retry. Consider `--chunk-size` to lower chunk size on flaky connections. |
+| Throttled (429/503) | The script retries up to 5 times with exponential backoff (5 s → 120 s) and honors `Retry-After` headers. If throttling persists, it aborts — re-run later to resume via ledger. |
 | Permission denied (403) | Your account needs write access to the target document library |
 | Token expired during upload | The script refreshes tokens automatically every 45 minutes |
 

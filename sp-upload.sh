@@ -11,6 +11,9 @@ readonly SMALL_FILE_LIMIT=$((4 * 1024 * 1024))  # 4 MB threshold
 readonly TOKEN_TTL=2700                          # Refresh token every 45 min
 readonly MIN_CHUNK_SIZE=$((320 * 1024))          # 320 KiB — Graph API minimum
 readonly MAX_CHUNK_SIZE=$((60 * 1024 * 1024))    # 60 MiB  — Graph API maximum
+readonly MAX_RETRIES=5                            # Max retry attempts on throttling
+readonly INITIAL_BACKOFF=5                        # Initial retry backoff (seconds)
+readonly MAX_BACKOFF=120                          # Max retry backoff (seconds)
 
 ###############################################################################
 # Global state
@@ -27,6 +30,8 @@ ACCESS_TOKEN=""
 TOKEN_ACQUIRED_AT=0
 SITE_ID=""
 DRIVE_ID=""
+_HTTP_BODY=""
+_HTTP_CODE=""
 
 ###############################################################################
 # Helpers
@@ -195,6 +200,51 @@ urlencode_path() {
 }
 
 ###############################################################################
+# Retry-aware HTTP client — backs off on 429 / 503, then aborts
+# Sets globals: _HTTP_BODY, _HTTP_CODE
+# Usage: graph_curl [curl-args...]  (omit -sS / -w / -o / -D)
+###############################################################################
+graph_curl() {
+  local attempt=0 backoff=$INITIAL_BACKOFF
+  local raw_response header_file
+  header_file="$(mktemp)"
+  trap "rm -f '${header_file}'" RETURN
+
+  while true; do
+    raw_response="$(curl -sS -D "$header_file" -w "\n%{http_code}" "$@")"
+    _HTTP_CODE="$(echo "$raw_response" | tail -1)"
+    _HTTP_BODY="$(echo "$raw_response" | sed '$d')"
+
+    case "$_HTTP_CODE" in
+      429|503)
+        (( attempt++ )) || true
+        if (( attempt > MAX_RETRIES )); then
+          die "Persistent throttling (HTTP $_HTTP_CODE) after ${MAX_RETRIES} retries — aborting. Re-run to resume."
+        fi
+
+        local retry_after=""
+        retry_after="$(grep -i '^Retry-After:' "$header_file" 2>/dev/null \
+          | head -1 | awk '{print $2}' | tr -d '\r\n')"
+
+        local wait_time="$backoff"
+        if [[ -n "$retry_after" ]] && [[ "$retry_after" =~ ^[0-9]+$ ]]; then
+          wait_time="$retry_after"
+        fi
+
+        warn "Throttled (HTTP $_HTTP_CODE), waiting ${wait_time}s before retry ${attempt}/${MAX_RETRIES}..."
+        sleep "$wait_time"
+
+        backoff=$(( backoff * 2 ))
+        (( backoff > MAX_BACKOFF )) && backoff=$MAX_BACKOFF
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+  done
+}
+
+###############################################################################
 # Resolve SharePoint site ID and drive (library) ID via Graph API
 ###############################################################################
 resolve_site_and_drive() {
@@ -216,21 +266,20 @@ resolve_site_and_drive() {
     endpoint="/sites/${hostname}"
   fi
 
-  local response
-  response="$(curl -sS -H "Authorization: Bearer $ACCESS_TOKEN" "${GRAPH_BASE}${endpoint}")"
-  SITE_ID="$(echo "$response" | jq -r '.id // empty')"
+  graph_curl -H "Authorization: Bearer $ACCESS_TOKEN" "${GRAPH_BASE}${endpoint}"
+  SITE_ID="$(echo "$_HTTP_BODY" | jq -r '.id // empty')"
   [[ -z "$SITE_ID" ]] && die "Could not resolve site: $SITE_URL"
   ok "Site ID: ${SITE_ID}"
 
   # Resolve drive (library)
   log "Resolving document library '${LIBRARY}'..."
-  response="$(curl -sS -H "Authorization: Bearer $ACCESS_TOKEN" \
-    "${GRAPH_BASE}/sites/${SITE_ID}/drives?\$select=id,name")"
-  DRIVE_ID="$(echo "$response" | jq -r --arg lib "$LIBRARY" \
+  graph_curl -H "Authorization: Bearer $ACCESS_TOKEN" \
+    "${GRAPH_BASE}/sites/${SITE_ID}/drives?\$select=id,name"
+  DRIVE_ID="$(echo "$_HTTP_BODY" | jq -r --arg lib "$LIBRARY" \
     '.value[] | select(.name == $lib) | .id // empty')"
   if [[ -z "$DRIVE_ID" ]]; then
     local available
-    available="$(echo "$response" | jq -r '.value[].name // empty' 2>/dev/null | paste -sd', ' -)"
+    available="$(echo "$_HTTP_BODY" | jq -r '.value[].name // empty' 2>/dev/null | paste -sd', ' -)"
     die "Library '${LIBRARY}' not found. Available: ${available:-none}"
   fi
   ok "Drive ID: ${DRIVE_ID}"
@@ -258,18 +307,16 @@ create_remote_folder() {
   body="$(jq -n --arg name "$leaf" \
     '{"name": $name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}')"
 
-  local result http_code
-  result="$(curl -sS -w "\n%{http_code}" -X POST "${GRAPH_BASE}${endpoint}" \
+  graph_curl -X POST "${GRAPH_BASE}${endpoint}" \
     -H "Authorization: Bearer $ACCESS_TOKEN" \
     -H "Content-Type: application/json" \
-    -d "$body")"
-  http_code="$(echo "$result" | tail -1)"
+    -d "$body"
 
-  case "$http_code" in
+  case "$_HTTP_CODE" in
     200|201) return 0 ;;
     409)     return 0 ;;  # Already exists
     *)
-      err "Failed to create folder (HTTP $http_code): $folder_path"
+      err "Failed to create folder (HTTP $_HTTP_CODE): $folder_path"
       return 1
       ;;
   esac
@@ -283,17 +330,16 @@ upload_small_file() {
   local encoded
   encoded="$(urlencode_path "$remote_path")"
 
-  local http_code
-  http_code="$(curl -sS -o /dev/null -w "%{http_code}" -X PUT \
+  graph_curl -X PUT \
     "${GRAPH_BASE}/drives/${DRIVE_ID}/root:/${encoded}:/content" \
     -H "Authorization: Bearer $ACCESS_TOKEN" \
     -H "Content-Type: application/octet-stream" \
-    --data-binary "@${local_path}")"
+    --data-binary "@${local_path}"
 
-  case "$http_code" in
+  case "$_HTTP_CODE" in
     200|201) return 0 ;;
     *)
-      err "Upload failed (HTTP $http_code): $remote_path"
+      err "Upload failed (HTTP $_HTTP_CODE): $remote_path"
       return 1
       ;;
   esac
@@ -311,15 +357,14 @@ upload_large_file() {
   encoded="$(urlencode_path "$remote_path")"
 
   # Create upload session
-  local session_response
-  session_response="$(curl -sS -X POST \
+  graph_curl -X POST \
     "${GRAPH_BASE}/drives/${DRIVE_ID}/root:/${encoded}:/createUploadSession" \
     -H "Authorization: Bearer $ACCESS_TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"item":{"@microsoft.graph.conflictBehavior":"replace"}}')"
+    -d '{"item":{"@microsoft.graph.conflictBehavior":"replace"}}'
 
   local upload_url
-  upload_url="$(echo "$session_response" | jq -r '.uploadUrl // empty')"
+  upload_url="$(echo "$_HTTP_BODY" | jq -r '.uploadUrl // empty')"
   [[ -z "$upload_url" ]] && { err "Failed to create upload session: $remote_path"; return 1; }
 
   # Upload in 10 MiB chunks
@@ -334,22 +379,35 @@ upload_large_file() {
 
     log "  Chunk ${chunk_idx}/${total_chunks}: bytes ${offset}-${end}/${file_size}"
 
-    local http_code
-    http_code="$(dd if="$local_path" bs="$CHUNK_SIZE" skip=$(( chunk_idx - 1 )) count=1 2>/dev/null | \
-      curl -sS -o /dev/null -w "%{http_code}" -X PUT "$upload_url" \
-        -H "Content-Length: ${this_chunk}" \
-        -H "Content-Range: bytes ${offset}-${end}/${file_size}" \
-        -H "Content-Type: application/octet-stream" \
-        --data-binary @-)"
+    local http_code="" chunk_attempt=0 chunk_backoff=$INITIAL_BACKOFF
+    while true; do
+      http_code="$(dd if="$local_path" bs="$CHUNK_SIZE" skip=$(( chunk_idx - 1 )) count=1 2>/dev/null | \
+        curl -sS -o /dev/null -w "%{http_code}" -X PUT "$upload_url" \
+          -H "Content-Length: ${this_chunk}" \
+          -H "Content-Range: bytes ${offset}-${end}/${file_size}" \
+          -H "Content-Type: application/octet-stream" \
+          --data-binary @-)"
 
-    case "$http_code" in
-      200|201|202) ;;
-      *)
-        err "Chunk upload failed (HTTP $http_code) at offset $offset"
-        curl -sS -X DELETE "$upload_url" >/dev/null 2>&1 || true
-        return 1
-        ;;
-    esac
+      case "$http_code" in
+        200|201|202) break ;;
+        429|503)
+          (( chunk_attempt++ )) || true
+          if (( chunk_attempt > MAX_RETRIES )); then
+            curl -sS -X DELETE "$upload_url" >/dev/null 2>&1 || true
+            die "Chunk throttled (HTTP $http_code) after ${MAX_RETRIES} retries at offset $offset — aborting. Re-run to resume."
+          fi
+          warn "Chunk throttled (HTTP $http_code), waiting ${chunk_backoff}s before retry ${chunk_attempt}/${MAX_RETRIES}..."
+          sleep "$chunk_backoff"
+          chunk_backoff=$(( chunk_backoff * 2 ))
+          (( chunk_backoff > MAX_BACKOFF )) && chunk_backoff=$MAX_BACKOFF
+          ;;
+        *)
+          err "Chunk upload failed (HTTP $http_code) at offset $offset"
+          curl -sS -X DELETE "$upload_url" >/dev/null 2>&1 || true
+          return 1
+          ;;
+      esac
+    done
 
     offset=$(( offset + this_chunk ))
   done
