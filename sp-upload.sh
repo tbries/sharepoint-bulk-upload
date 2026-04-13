@@ -116,6 +116,21 @@ get_file_size() {
   stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null
 }
 
+# Extract error details from a Graph API JSON response body.
+# Outputs a one-liner like: code=accessDenied, message=Access denied
+_graph_error_detail() {
+  local body="${1:-$_HTTP_BODY}"
+  local code msg
+  code="$(echo "$body" | jq -r '.error.code // empty' 2>/dev/null)"
+  msg="$(echo "$body" | jq -r '.error.message // empty' 2>/dev/null)"
+  if [[ -n "$code" || -n "$msg" ]]; then
+    echo "code=${code:-unknown}, message=${msg:-<none>}"
+  else
+    # Truncate raw body to avoid flooding logs
+    echo "${body:0:500}"
+  fi
+}
+
 ###############################################################################
 # Argument parsing
 ###############################################################################
@@ -235,7 +250,8 @@ graph_curl() {
       429|503)
         (( attempt++ )) || true
         if (( attempt > MAX_RETRIES )); then
-          die "Persistent throttling (HTTP $_HTTP_CODE) after ${MAX_RETRIES} retries — aborting. Re-run to resume."
+          local detail; detail="$(_graph_error_detail)"
+          die "Persistent throttling (HTTP $_HTTP_CODE) after ${MAX_RETRIES} retries — aborting. Detail: ${detail}. Re-run to resume."
         fi
 
         local retry_after=""
@@ -284,7 +300,10 @@ resolve_site_and_drive() {
 
   graph_curl -H "Authorization: Bearer $ACCESS_TOKEN" "${GRAPH_BASE}${endpoint}"
   SITE_ID="$(echo "$_HTTP_BODY" | jq -r '.id // empty')"
-  [[ -z "$SITE_ID" ]] && die "Could not resolve site: $SITE_URL"
+  if [[ -z "$SITE_ID" ]]; then
+    local detail; detail="$(_graph_error_detail)"
+    die "Could not resolve site (HTTP $_HTTP_CODE): $SITE_URL — ${detail}"
+  fi
   ok "Site ID: ${SITE_ID}"
 
   # Resolve drive (library)
@@ -294,6 +313,10 @@ resolve_site_and_drive() {
   DRIVE_ID="$(echo "$_HTTP_BODY" | jq -r --arg lib "$LIBRARY" \
     '.value[] | select(.name == $lib) | .id // empty')"
   if [[ -z "$DRIVE_ID" ]]; then
+    if [[ "$_HTTP_CODE" != "200" ]]; then
+      local detail; detail="$(_graph_error_detail)"
+      die "Failed to list drives (HTTP $_HTTP_CODE): ${detail}"
+    fi
     local available
     available="$(echo "$_HTTP_BODY" | jq -r '.value[].name // empty' 2>/dev/null | paste -sd', ' -)"
     die "Library '${LIBRARY}' not found. Available: ${available:-none}"
@@ -332,7 +355,8 @@ create_remote_folder() {
     200|201) return 0 ;;
     409)     return 0 ;;  # Already exists
     *)
-      err "Failed to create folder (HTTP $_HTTP_CODE): $folder_path"
+      local detail; detail="$(_graph_error_detail)"
+      err "Failed to create folder (HTTP $_HTTP_CODE): $folder_path — ${detail}"
       return 1
       ;;
   esac
@@ -355,7 +379,8 @@ upload_small_file() {
   case "$_HTTP_CODE" in
     200|201) return 0 ;;
     *)
-      err "Upload failed (HTTP $_HTTP_CODE): $remote_path"
+      local detail; detail="$(_graph_error_detail)"
+      err "Upload failed (HTTP $_HTTP_CODE): $remote_path — ${detail}"
       return 1
       ;;
   esac
@@ -381,7 +406,11 @@ upload_large_file() {
 
   local upload_url
   upload_url="$(echo "$_HTTP_BODY" | jq -r '.uploadUrl // empty')"
-  [[ -z "$upload_url" ]] && { err "Failed to create upload session: $remote_path"; return 1; }
+  if [[ -z "$upload_url" ]]; then
+    local detail; detail="$(_graph_error_detail)"
+    err "Failed to create upload session (HTTP $_HTTP_CODE): $remote_path — ${detail}"
+    return 1
+  fi
 
   # Upload in 10 MiB chunks
   local offset=0 chunk_idx=0
@@ -410,7 +439,7 @@ upload_large_file() {
           (( chunk_attempt++ )) || true
           if (( chunk_attempt > MAX_RETRIES )); then
             curl -sS -X DELETE "$upload_url" >/dev/null 2>&1 || true
-            die "Chunk throttled (HTTP $http_code) after ${MAX_RETRIES} retries at offset $offset — aborting. Re-run to resume."
+            die "Chunk throttled (HTTP $http_code) after ${MAX_RETRIES} retries at offset $offset of $remote_path — aborting. Re-run to resume."
           fi
           warn "Chunk throttled (HTTP $http_code), waiting ${chunk_backoff}s before retry ${chunk_attempt}/${MAX_RETRIES}..."
           sleep "$chunk_backoff"
@@ -418,7 +447,7 @@ upload_large_file() {
           (( chunk_backoff > MAX_BACKOFF )) && chunk_backoff=$MAX_BACKOFF
           ;;
         *)
-          err "Chunk upload failed (HTTP $http_code) at offset $offset"
+          err "Chunk upload failed (HTTP $http_code) at offset $offset of $remote_path"
           curl -sS -X DELETE "$upload_url" >/dev/null 2>&1 || true
           return 1
           ;;
