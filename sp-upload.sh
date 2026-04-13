@@ -548,14 +548,12 @@ upload_all() {
     fi
   done
 
-  # Pre-scan: collect all files and compute stats
-  local all_files=() all_sizes=()
-  local total_bytes=0 largest_bytes=0 largest_name=""
+  # Pre-scan: streaming pass to compute totals only (no arrays)
+  local total=0 total_bytes=0 largest_bytes=0 largest_name=""
   while IFS= read -r -d '' file; do
     local fsize
     fsize="$(get_file_size "$file")"
-    all_files+=("$file")
-    all_sizes+=("$fsize")
+    (( total++ )) || true
     (( total_bytes += fsize )) || true
     if (( fsize > largest_bytes )); then
       largest_bytes=$fsize
@@ -563,7 +561,6 @@ upload_all() {
     fi
   done < <(find "$SOURCE" -type f ! -name ".sp-upload-ledger" -print0 | sort -z)
 
-  total=${#all_files[@]}
   echo ""
   log "───────────────────────────────────────"
   log "Files to process  : ${total}"
@@ -574,16 +571,13 @@ upload_all() {
   log "───────────────────────────────────────"
   echo ""
 
-  # Upload files with progress tracking
+  # Upload files with progress tracking — stream directly from find
   local bytes_processed=0 files_processed=0
   local upload_bytes_done=0 upload_time_elapsed=0
-  local loop_start
-  loop_start="$(date +%s)"
 
-  local idx=0
-  for file in "${all_files[@]}"; do
-    local fsize="${all_sizes[$idx]}"
-    (( idx++ )) || true
+  while IFS= read -r -d '' file; do
+    local fsize
+    fsize="$(get_file_size "$file")"
     local rel="${file#"$SOURCE/"}"
 
     local hash
@@ -641,7 +635,7 @@ upload_all() {
     (( bytes_processed += fsize )) || true
     _print_progress "$files_processed" "$total" "$bytes_processed" "$total_bytes" \
       "$upload_bytes_done" "$upload_time_elapsed"
-  done
+  done < <(find "$SOURCE" -type f ! -name ".sp-upload-ledger" -print0 | sort -z)
 
   # Summary
   echo ""
