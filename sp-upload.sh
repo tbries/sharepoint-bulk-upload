@@ -96,6 +96,22 @@ human_size() {
   fi
 }
 
+human_time() {
+  local secs="$1"
+  if (( secs <= 0 )); then
+    echo "< 1s"
+    return
+  fi
+  local h=$(( secs / 3600 ))
+  local m=$(( (secs % 3600) / 60 ))
+  local s=$(( secs % 60 ))
+  local out=""
+  (( h > 0 )) && out="${h}h "
+  (( m > 0 )) && out="${out}${m}m "
+  out="${out}${s}s"
+  echo "$out"
+}
+
 get_file_size() {
   stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null
 }
@@ -441,6 +457,37 @@ ledger_record() {
 readonly TAB=$'\t'
 
 ###############################################################################
+# Progress display — called after each file is processed
+###############################################################################
+_print_progress() {
+  local files_done="$1" files_total="$2"
+  local bytes_done="$3" bytes_total="$4"
+  local upload_bytes="$5" upload_secs="$6"
+
+  local files_left=$(( files_total - files_done ))
+  local bytes_left=$(( bytes_total - bytes_done ))
+
+  log "  Progress : ${files_done}/${files_total} files, $(human_size "$bytes_done")/$(human_size "$bytes_total")"
+  log "  Remaining: ${files_left} files, $(human_size "$bytes_left")"
+
+  if (( upload_secs > 0 && upload_bytes > 0 )); then
+    local throughput=$(( upload_bytes / upload_secs ))
+    if (( throughput > 0 && bytes_left > 0 )); then
+      local eta_secs=$(( bytes_left / throughput ))
+      log "  ETA      : ~$(human_time "$eta_secs")"
+    elif (( bytes_left == 0 )); then
+      log "  ETA      : done"
+    fi
+  else
+    if (( bytes_left > 0 )); then
+      log "  ETA      : estimating..."
+    else
+      log "  ETA      : done"
+    fi
+  fi
+}
+
+###############################################################################
 # Upload workflow
 ###############################################################################
 upload_all() {
@@ -501,10 +548,37 @@ upload_all() {
     fi
   done
 
-  # Upload files
+  # Pre-scan: streaming pass to compute totals only (no arrays)
+  local total=0 total_bytes=0 largest_bytes=0 largest_name=""
   while IFS= read -r -d '' file; do
-    local rel="${file#"$SOURCE/"}"
+    local fsize
+    fsize="$(get_file_size "$file")"
     (( total++ )) || true
+    (( total_bytes += fsize )) || true
+    if (( fsize > largest_bytes )); then
+      largest_bytes=$fsize
+      largest_name="${file#"$SOURCE/"}"
+    fi
+  done < <(find "$SOURCE" -type f ! -name ".sp-upload-ledger" -print0 | sort -z)
+
+  echo ""
+  log "───────────────────────────────────────"
+  log "Files to process  : ${total}"
+  log "Total size        : $(human_size "$total_bytes")"
+  if (( total > 0 )); then
+    log "Largest file      : $(human_size "$largest_bytes") (${largest_name})"
+  fi
+  log "───────────────────────────────────────"
+  echo ""
+
+  # Upload files with progress tracking — stream directly from find
+  local bytes_processed=0 files_processed=0
+  local upload_bytes_done=0 upload_time_elapsed=0
+
+  while IFS= read -r -d '' file; do
+    local fsize
+    fsize="$(get_file_size "$file")"
+    local rel="${file#"$SOURCE/"}"
 
     local hash
     hash="$(ledger_hash "$file")"
@@ -512,6 +586,10 @@ upload_all() {
     if ledger_lookup "$rel" "$hash"; then
       (( skipped++ )) || true
       log "Skipping (already uploaded): ${rel}"
+      (( files_processed++ )) || true
+      (( bytes_processed += fsize )) || true
+      _print_progress "$files_processed" "$total" "$bytes_processed" "$total_bytes" \
+        "$upload_bytes_done" "$upload_time_elapsed"
       continue
     fi
 
@@ -519,19 +597,19 @@ upload_all() {
     [[ -n "$base_path" ]] && remote_file_path="${base_path}/${rel}" || remote_file_path="$rel"
 
     if $DRY_RUN; then
-      local fsize
-      fsize="$(get_file_size "$file")"
       local method="simple"
       (( fsize >= SMALL_FILE_LIMIT )) && method="chunked"
       log "[DRY-RUN] Would upload (${method}, $(human_size "$fsize")): ${rel}"
+      (( files_processed++ )) || true
+      (( bytes_processed += fsize )) || true
       continue
     fi
 
     refresh_token
-
-    local fsize
-    fsize="$(get_file_size "$file")"
     log "Uploading: ${rel} ($(human_size "$fsize"))"
+
+    local file_start file_end
+    file_start="$(date +%s)"
 
     local upload_ok=false
     if (( fsize < SMALL_FILE_LIMIT )); then
@@ -540,14 +618,23 @@ upload_all() {
       upload_large_file "$file" "$remote_file_path" && upload_ok=true
     fi
 
+    file_end="$(date +%s)"
+
     if $upload_ok; then
       ok "Uploaded: ${rel}"
       ledger_record "$rel" "$hash"
       (( uploaded++ )) || true
+      (( upload_bytes_done += fsize )) || true
+      (( upload_time_elapsed += file_end - file_start )) || true
     else
       err "Failed: ${rel}"
       (( failed++ )) || true
     fi
+
+    (( files_processed++ )) || true
+    (( bytes_processed += fsize )) || true
+    _print_progress "$files_processed" "$total" "$bytes_processed" "$total_bytes" \
+      "$upload_bytes_done" "$upload_time_elapsed"
   done < <(find "$SOURCE" -type f ! -name ".sp-upload-ledger" -print0 | sort -z)
 
   # Summary
