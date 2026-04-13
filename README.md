@@ -11,6 +11,8 @@ own identity (browser sign-in, MFA supported).
 
 - Mirrors local directory structure on SharePoint automatically
 - **Large-file support** — files ≥ 4 MB use chunked upload sessions (10 MiB chunks)
+- **Progress reporting** — pre-upload file stats (count, total size, largest file)
+  and per-file progress with ETA during uploads
 - **Resume/retry** — SHA-256 ledger tracks uploads; re-running skips unchanged
   files and retries failures
 - **Throttle handling** — automatic exponential backoff on HTTP 429 / 503 with
