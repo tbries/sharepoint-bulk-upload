@@ -116,6 +116,21 @@ get_file_size() {
   stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null
 }
 
+# Extract error details from a Graph API JSON response body.
+# Outputs a one-liner like: code=accessDenied, message=Access denied
+_graph_error_detail() {
+  local body="${1:-$_HTTP_BODY}"
+  local code msg
+  code="$(printf '%s' "$body" | jq -r '.error.code // empty' 2>/dev/null)"
+  msg="$(printf '%s' "$body" | jq -r '.error.message // empty' 2>/dev/null)"
+  if [[ -n "$code" || -n "$msg" ]]; then
+    echo "code=${code:-unknown}, message=${msg:-<none>}"
+  else
+    # Truncate raw body to avoid flooding logs
+    echo "${body:0:500}"
+  fi
+}
+
 ###############################################################################
 # Argument parsing
 ###############################################################################
@@ -223,19 +238,38 @@ urlencode_path() {
 graph_curl() {
   local attempt=0 backoff=$INITIAL_BACKOFF
   local raw_response header_file
+  local args=("$@")
   header_file="$(mktemp)"
   trap "rm -f '${header_file}'" RETURN
 
   while true; do
-    raw_response="$(curl -sS -D "$header_file" -w "\n%{http_code}" "$@")"
+    raw_response="$(curl -sS -D "$header_file" -w "\n%{http_code}" "${args[@]}")"
     _HTTP_CODE="$(echo "$raw_response" | tail -1)"
     _HTTP_BODY="$(echo "$raw_response" | sed '$d')"
 
     case "$_HTTP_CODE" in
+      401)
+        (( attempt++ )) || true
+        if (( attempt > MAX_RETRIES )); then
+          local detail; detail="$(_graph_error_detail)"
+          die "Authentication failed (HTTP 401) after ${MAX_RETRIES} retries — aborting. Detail: ${detail}"
+        fi
+        warn "Token expired (HTTP 401), refreshing token (attempt ${attempt}/${MAX_RETRIES})..."
+        TOKEN_ACQUIRED_AT=0
+        refresh_token
+        # Update Authorization header in saved args with new token
+        local i
+        for (( i = 0; i < ${#args[@]}; i++ )); do
+          if [[ "${args[$i]}" == Authorization:\ Bearer\ * ]]; then
+            args[$i]="Authorization: Bearer $ACCESS_TOKEN"
+          fi
+        done
+        ;;
       429|503)
         (( attempt++ )) || true
         if (( attempt > MAX_RETRIES )); then
-          die "Persistent throttling (HTTP $_HTTP_CODE) after ${MAX_RETRIES} retries — aborting. Re-run to resume."
+          local detail; detail="$(_graph_error_detail)"
+          die "Persistent throttling (HTTP $_HTTP_CODE) after ${MAX_RETRIES} retries — aborting. Detail: ${detail}. Re-run to resume."
         fi
 
         local retry_after=""
@@ -284,7 +318,10 @@ resolve_site_and_drive() {
 
   graph_curl -H "Authorization: Bearer $ACCESS_TOKEN" "${GRAPH_BASE}${endpoint}"
   SITE_ID="$(echo "$_HTTP_BODY" | jq -r '.id // empty')"
-  [[ -z "$SITE_ID" ]] && die "Could not resolve site: $SITE_URL"
+  if [[ -z "$SITE_ID" ]]; then
+    local detail; detail="$(_graph_error_detail)"
+    die "Could not resolve site (HTTP $_HTTP_CODE): $SITE_URL — ${detail}"
+  fi
   ok "Site ID: ${SITE_ID}"
 
   # Resolve drive (library)
@@ -294,6 +331,10 @@ resolve_site_and_drive() {
   DRIVE_ID="$(echo "$_HTTP_BODY" | jq -r --arg lib "$LIBRARY" \
     '.value[] | select(.name == $lib) | .id // empty')"
   if [[ -z "$DRIVE_ID" ]]; then
+    if [[ "$_HTTP_CODE" != "200" ]]; then
+      local detail; detail="$(_graph_error_detail)"
+      die "Failed to list drives (HTTP $_HTTP_CODE): ${detail}"
+    fi
     local available
     available="$(echo "$_HTTP_BODY" | jq -r '.value[].name // empty' 2>/dev/null | paste -sd', ' -)"
     die "Library '${LIBRARY}' not found. Available: ${available:-none}"
@@ -332,7 +373,8 @@ create_remote_folder() {
     200|201) return 0 ;;
     409)     return 0 ;;  # Already exists
     *)
-      err "Failed to create folder (HTTP $_HTTP_CODE): $folder_path"
+      local detail; detail="$(_graph_error_detail)"
+      err "Failed to create folder (HTTP $_HTTP_CODE): $folder_path — ${detail}"
       return 1
       ;;
   esac
@@ -355,7 +397,8 @@ upload_small_file() {
   case "$_HTTP_CODE" in
     200|201) return 0 ;;
     *)
-      err "Upload failed (HTTP $_HTTP_CODE): $remote_path"
+      local detail; detail="$(_graph_error_detail)"
+      err "Upload failed (HTTP $_HTTP_CODE): $remote_path — ${detail}"
       return 1
       ;;
   esac
@@ -372,16 +415,35 @@ upload_large_file() {
   local encoded
   encoded="$(urlencode_path "$remote_path")"
 
-  # Create upload session
-  graph_curl -X POST \
-    "${GRAPH_BASE}/drives/${DRIVE_ID}/root:/${encoded}:/createUploadSession" \
-    -H "Authorization: Bearer $ACCESS_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"item":{"@microsoft.graph.conflictBehavior":"replace"}}'
+  # Create upload session (with retries + exponential backoff)
+  local upload_url="" session_attempt=0 session_backoff=$INITIAL_BACKOFF
+  while true; do
+    graph_curl -X POST \
+      "${GRAPH_BASE}/drives/${DRIVE_ID}/root:/${encoded}:/createUploadSession" \
+      -H "Authorization: Bearer $ACCESS_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"item":{"@microsoft.graph.conflictBehavior":"replace"}}'
 
-  local upload_url
-  upload_url="$(echo "$_HTTP_BODY" | jq -r '.uploadUrl // empty')"
-  [[ -z "$upload_url" ]] && { err "Failed to create upload session: $remote_path"; return 1; }
+    upload_url="$(echo "$_HTTP_BODY" | jq -r '.uploadUrl // empty')"
+    if [[ -n "$upload_url" ]]; then
+      break
+    fi
+
+    (( session_attempt++ )) || true
+    if (( session_attempt > MAX_RETRIES )); then
+      local detail; detail="$(_graph_error_detail)"
+      err "Failed to create upload session (HTTP $_HTTP_CODE) after ${MAX_RETRIES} retries: $remote_path — ${detail}"
+      return 1
+    fi
+
+    local detail; detail="$(_graph_error_detail)"
+    warn "Upload session creation failed (HTTP $_HTTP_CODE, attempt ${session_attempt}/${MAX_RETRIES}): $remote_path — ${detail}"
+    warn "Retrying in ${session_backoff}s..."
+    sleep "$session_backoff"
+    session_backoff=$(( session_backoff * 2 ))
+    (( session_backoff > MAX_BACKOFF )) && session_backoff=$MAX_BACKOFF
+    refresh_token
+  done
 
   # Upload in 10 MiB chunks
   local offset=0 chunk_idx=0
@@ -410,7 +472,7 @@ upload_large_file() {
           (( chunk_attempt++ )) || true
           if (( chunk_attempt > MAX_RETRIES )); then
             curl -sS -X DELETE "$upload_url" >/dev/null 2>&1 || true
-            die "Chunk throttled (HTTP $http_code) after ${MAX_RETRIES} retries at offset $offset — aborting. Re-run to resume."
+            die "Chunk throttled (HTTP $http_code) after ${MAX_RETRIES} retries at offset $offset of $remote_path — aborting. Re-run to resume."
           fi
           warn "Chunk throttled (HTTP $http_code), waiting ${chunk_backoff}s before retry ${chunk_attempt}/${MAX_RETRIES}..."
           sleep "$chunk_backoff"
@@ -418,7 +480,7 @@ upload_large_file() {
           (( chunk_backoff > MAX_BACKOFF )) && chunk_backoff=$MAX_BACKOFF
           ;;
         *)
-          err "Chunk upload failed (HTTP $http_code) at offset $offset"
+          err "Chunk upload failed (HTTP $http_code) at offset $offset of $remote_path"
           curl -sS -X DELETE "$upload_url" >/dev/null 2>&1 || true
           return 1
           ;;
@@ -432,29 +494,18 @@ upload_large_file() {
 }
 
 ###############################################################################
-# Ledger helpers — SHA-256 based resume tracking
+# Ledger helpers — path-based resume tracking
 ###############################################################################
-ledger_hash() {
-  shasum -a 256 "$1" | awk '{print $1}'
-}
-
 ledger_lookup() {
-  local rel_path="$1" hash="$2"
+  local rel_path="$1"
   [[ -f "$LEDGER_FILE" ]] || return 1
-  grep -qF "${rel_path}${TAB}${hash}" "$LEDGER_FILE" 2>/dev/null
+  grep -qFx "$rel_path" "$LEDGER_FILE" 2>/dev/null
 }
 
 ledger_record() {
-  local rel_path="$1" hash="$2"
-  if [[ -f "$LEDGER_FILE" ]]; then
-    local tmp="${LEDGER_FILE}.tmp"
-    grep -vF "${rel_path}${TAB}" "$LEDGER_FILE" > "$tmp" 2>/dev/null || true
-    mv "$tmp" "$LEDGER_FILE"
-  fi
-  printf '%s\t%s\n' "$rel_path" "$hash" >> "$LEDGER_FILE"
+  local rel_path="$1"
+  echo "$rel_path" >> "$LEDGER_FILE"
 }
-
-readonly TAB=$'\t'
 
 ###############################################################################
 # Progress display — called after each file is processed
@@ -580,10 +631,7 @@ upload_all() {
     fsize="$(get_file_size "$file")"
     local rel="${file#"$SOURCE/"}"
 
-    local hash
-    hash="$(ledger_hash "$file")"
-
-    if ledger_lookup "$rel" "$hash"; then
+    if ledger_lookup "$rel"; then
       (( skipped++ )) || true
       log "Skipping (already uploaded): ${rel}"
       (( files_processed++ )) || true
@@ -622,7 +670,7 @@ upload_all() {
 
     if $upload_ok; then
       ok "Uploaded: ${rel}"
-      ledger_record "$rel" "$hash"
+      ledger_record "$rel"
       (( uploaded++ )) || true
       (( upload_bytes_done += fsize )) || true
       (( upload_time_elapsed += file_end - file_start )) || true
@@ -644,7 +692,7 @@ upload_all() {
   log "  Directories created : ${dirs_created}"
   log "  Files total         : ${total}"
   log "  Uploaded            : ${uploaded}"
-  log "  Skipped (unchanged) : ${skipped}"
+  log "  Skipped (resuming)  : ${skipped}"
   log "  Failed              : ${failed}"
   log "═══════════════════════════════════════"
 
