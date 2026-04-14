@@ -397,20 +397,35 @@ upload_large_file() {
   local encoded
   encoded="$(urlencode_path "$remote_path")"
 
-  # Create upload session
-  graph_curl -X POST \
-    "${GRAPH_BASE}/drives/${DRIVE_ID}/root:/${encoded}:/createUploadSession" \
-    -H "Authorization: Bearer $ACCESS_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"item":{"@microsoft.graph.conflictBehavior":"replace"}}'
+  # Create upload session (with retries + exponential backoff)
+  local upload_url="" session_attempt=0 session_backoff=$INITIAL_BACKOFF
+  while true; do
+    graph_curl -X POST \
+      "${GRAPH_BASE}/drives/${DRIVE_ID}/root:/${encoded}:/createUploadSession" \
+      -H "Authorization: Bearer $ACCESS_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"item":{"@microsoft.graph.conflictBehavior":"replace"}}'
 
-  local upload_url
-  upload_url="$(echo "$_HTTP_BODY" | jq -r '.uploadUrl // empty')"
-  if [[ -z "$upload_url" ]]; then
+    upload_url="$(echo "$_HTTP_BODY" | jq -r '.uploadUrl // empty')"
+    if [[ -n "$upload_url" ]]; then
+      break
+    fi
+
+    (( session_attempt++ )) || true
+    if (( session_attempt > MAX_RETRIES )); then
+      local detail; detail="$(_graph_error_detail)"
+      err "Failed to create upload session (HTTP $_HTTP_CODE) after ${MAX_RETRIES} retries: $remote_path — ${detail}"
+      return 1
+    fi
+
     local detail; detail="$(_graph_error_detail)"
-    err "Failed to create upload session (HTTP $_HTTP_CODE): $remote_path — ${detail}"
-    return 1
-  fi
+    warn "Upload session creation failed (HTTP $_HTTP_CODE, attempt ${session_attempt}/${MAX_RETRIES}): $remote_path — ${detail}"
+    warn "Retrying in ${session_backoff}s..."
+    sleep "$session_backoff"
+    session_backoff=$(( session_backoff * 2 ))
+    (( session_backoff > MAX_BACKOFF )) && session_backoff=$MAX_BACKOFF
+    refresh_token
+  done
 
   # Upload in 10 MiB chunks
   local offset=0 chunk_idx=0
