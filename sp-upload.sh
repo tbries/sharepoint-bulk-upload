@@ -121,8 +121,8 @@ get_file_size() {
 _graph_error_detail() {
   local body="${1:-$_HTTP_BODY}"
   local code msg
-  code="$(echo "$body" | jq -r '.error.code // empty' 2>/dev/null)"
-  msg="$(echo "$body" | jq -r '.error.message // empty' 2>/dev/null)"
+  code="$(printf '%s' "$body" | jq -r '.error.code // empty' 2>/dev/null)"
+  msg="$(printf '%s' "$body" | jq -r '.error.message // empty' 2>/dev/null)"
   if [[ -n "$code" || -n "$msg" ]]; then
     echo "code=${code:-unknown}, message=${msg:-<none>}"
   else
