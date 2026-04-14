@@ -238,15 +238,33 @@ urlencode_path() {
 graph_curl() {
   local attempt=0 backoff=$INITIAL_BACKOFF
   local raw_response header_file
+  local args=("$@")
   header_file="$(mktemp)"
   trap "rm -f '${header_file}'" RETURN
 
   while true; do
-    raw_response="$(curl -sS -D "$header_file" -w "\n%{http_code}" "$@")"
+    raw_response="$(curl -sS -D "$header_file" -w "\n%{http_code}" "${args[@]}")"
     _HTTP_CODE="$(echo "$raw_response" | tail -1)"
     _HTTP_BODY="$(echo "$raw_response" | sed '$d')"
 
     case "$_HTTP_CODE" in
+      401)
+        (( attempt++ )) || true
+        if (( attempt > MAX_RETRIES )); then
+          local detail; detail="$(_graph_error_detail)"
+          die "Authentication failed (HTTP 401) after ${MAX_RETRIES} retries — aborting. Detail: ${detail}"
+        fi
+        warn "Token expired (HTTP 401), refreshing token (attempt ${attempt}/${MAX_RETRIES})..."
+        TOKEN_ACQUIRED_AT=0
+        refresh_token
+        # Update Authorization header in saved args with new token
+        local i
+        for (( i = 0; i < ${#args[@]}; i++ )); do
+          if [[ "${args[$i]}" == Authorization:\ Bearer\ * ]]; then
+            args[$i]="Authorization: Bearer $ACCESS_TOKEN"
+          fi
+        done
+        ;;
       429|503)
         (( attempt++ )) || true
         if (( attempt > MAX_RETRIES )); then
