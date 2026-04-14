@@ -494,29 +494,18 @@ upload_large_file() {
 }
 
 ###############################################################################
-# Ledger helpers — SHA-256 based resume tracking
+# Ledger helpers — path-based resume tracking
 ###############################################################################
-ledger_hash() {
-  shasum -a 256 "$1" | awk '{print $1}'
-}
-
 ledger_lookup() {
-  local rel_path="$1" hash="$2"
+  local rel_path="$1"
   [[ -f "$LEDGER_FILE" ]] || return 1
-  grep -qF "${rel_path}${TAB}${hash}" "$LEDGER_FILE" 2>/dev/null
+  grep -qFx "$rel_path" "$LEDGER_FILE" 2>/dev/null
 }
 
 ledger_record() {
-  local rel_path="$1" hash="$2"
-  if [[ -f "$LEDGER_FILE" ]]; then
-    local tmp="${LEDGER_FILE}.tmp"
-    grep -vF "${rel_path}${TAB}" "$LEDGER_FILE" > "$tmp" 2>/dev/null || true
-    mv "$tmp" "$LEDGER_FILE"
-  fi
-  printf '%s\t%s\n' "$rel_path" "$hash" >> "$LEDGER_FILE"
+  local rel_path="$1"
+  echo "$rel_path" >> "$LEDGER_FILE"
 }
-
-readonly TAB=$'\t'
 
 ###############################################################################
 # Progress display — called after each file is processed
@@ -642,10 +631,7 @@ upload_all() {
     fsize="$(get_file_size "$file")"
     local rel="${file#"$SOURCE/"}"
 
-    local hash
-    hash="$(ledger_hash "$file")"
-
-    if ledger_lookup "$rel" "$hash"; then
+    if ledger_lookup "$rel"; then
       (( skipped++ )) || true
       log "Skipping (already uploaded): ${rel}"
       (( files_processed++ )) || true
@@ -684,7 +670,7 @@ upload_all() {
 
     if $upload_ok; then
       ok "Uploaded: ${rel}"
-      ledger_record "$rel" "$hash"
+      ledger_record "$rel"
       (( uploaded++ )) || true
       (( upload_bytes_done += fsize )) || true
       (( upload_time_elapsed += file_end - file_start )) || true
@@ -706,7 +692,7 @@ upload_all() {
   log "  Directories created : ${dirs_created}"
   log "  Files total         : ${total}"
   log "  Uploaded            : ${uploaded}"
-  log "  Skipped (unchanged) : ${skipped}"
+  log "  Skipped (resuming)  : ${skipped}"
   log "  Failed              : ${failed}"
   log "═══════════════════════════════════════"
 
