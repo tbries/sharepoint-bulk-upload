@@ -132,9 +132,9 @@ EXTENSIONS=(
   ".vmdk" ".vhd" ".qcow2" ".ova" ".dmg" ".pkg" ".deb"
 )
 
-# Minimum 50 MB, maximum 20 GB (in bytes)
+# Minimum 50 MB, maximum 1 GB (in bytes)
 MIN_FILE_SIZE=$((50 * 1024 * 1024))
-MAX_FILE_SIZE=$((20 * 1024 * 1024 * 1024))
+MAX_FILE_SIZE=$((1 * 1024 * 1024 * 1024))
 
 # ---------------------------------------------------------------------------
 # Generate a single file using dd (fast, /dev/urandom)
