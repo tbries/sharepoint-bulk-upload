@@ -13,9 +13,6 @@
     .\sp-upload.ps1 --source .\reports --site-url https://contoso.sharepoint.com/sites/finance --library Documents --remote-path "2026/Q1" --dry-run
 #>
 
-[CmdletBinding()]
-param()
-
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -225,10 +222,10 @@ function Read-Arguments {
 # Pre-flight checks
 ###############################################################################
 function Test-Preflight {
-    $azPath = Get-Command az -ErrorAction SilentlyContinue
-    if (-not $azPath) { Stop-WithError 'Azure CLI not found. Install: https://aka.ms/installazurecli' }
-
     if (-not $script:DryRun) {
+        $azPath = Get-Command az -ErrorAction SilentlyContinue
+        if (-not $azPath) { Stop-WithError 'Azure CLI not found. Install: https://aka.ms/installazurecli' }
+
         Write-Log 'Checking Azure CLI login status...'
         $null = az account show -o none 2>$null
         if ($LASTEXITCODE -ne 0) {
@@ -236,7 +233,7 @@ function Test-Preflight {
         }
         Write-Ok 'Authenticated via Azure CLI'
     } else {
-        Write-Warn 'Dry-run mode - skipping authentication check'
+        Write-Warn 'Dry-run mode - skipping Azure CLI and authentication checks'
     }
 
     if (-not (Test-Path -LiteralPath $script:Source -PathType Container)) {
@@ -477,9 +474,9 @@ function New-RemoteFolder {
     }
 
     $bodyObj = @{
-        name                                  = $leaf
-        folder                                = @{}
-        '@microsoft.graph.conflictBehavior'   = 'fail'
+        name                                = $leaf
+        folder                              = @{}
+        '@microsoft.graph.conflictBehavior' = 'fail'
     }
     $bodyJson = $bodyObj | ConvertTo-Json -Compress
 
@@ -522,6 +519,111 @@ function Send-SmallFile {
 }
 
 ###############################################################################
+# Upload session helpers
+###############################################################################
+function Invoke-UploadSessionRequest {
+    param(
+        [string]$Uri,
+        [string]$Method = 'PUT',
+        [hashtable]$Headers = @{},
+        [object]$Body = $null,
+        [string]$ContentType = $null
+    )
+
+    $statusCode      = 0
+    $responseBody    = ''
+    $responseHeaders = @{}
+    $networkError    = $false
+
+    try {
+        $params = @{
+            Uri             = $Uri
+            Method          = $Method
+            Headers         = $Headers
+            UseBasicParsing = $true
+            ErrorAction     = 'Stop'
+        }
+        if ($ContentType) { $params['ContentType'] = $ContentType }
+        if ($PSBoundParameters.ContainsKey('Body')) { $params['Body'] = $Body }
+
+        $response        = Invoke-WebRequest @params
+        $statusCode      = [int]$response.StatusCode
+        $responseBody    = $response.Content
+        $responseHeaders = $response.Headers
+    } catch {
+        $ex = $_.Exception
+        if ($ex.PSObject.Properties['Response'] -and $ex.Response) {
+            $statusCode = [int]$ex.Response.StatusCode
+            try {
+                foreach ($key in $ex.Response.Headers.AllKeys) {
+                    $responseHeaders[$key] = $ex.Response.Headers[$key]
+                }
+            } catch {}
+            try {
+                $stream = $ex.Response.GetResponseStream()
+                $reader = [System.IO.StreamReader]::new($stream)
+                $responseBody = $reader.ReadToEnd()
+                $reader.Close()
+                $stream.Close()
+            } catch {
+                $responseBody = $ex.Message
+            }
+        } else {
+            $networkError = $true
+            $responseBody = $ex.Message
+        }
+    }
+
+    return @{
+        Body           = $responseBody
+        StatusCode     = $statusCode
+        Headers        = $responseHeaders
+        IsNetworkError = $networkError
+    }
+}
+
+function Get-UploadSessionNextOffset {
+    param([string]$Body)
+
+    if (-not $Body) { return $null }
+
+    try {
+        $parsed = $Body | ConvertFrom-Json -ErrorAction Stop
+        $range = $parsed.nextExpectedRanges | Select-Object -First 1
+        if ($range -and $range -match '^(\d+)-') {
+            return [long]$Matches[1]
+        }
+    } catch {}
+
+    return $null
+}
+
+function Get-UploadSessionStatus {
+    param([string]$UploadUrl)
+
+    $result = Invoke-UploadSessionRequest -Uri $UploadUrl -Method 'GET'
+    $nextOffset = $null
+    if ($result.StatusCode -eq 200) {
+        $nextOffset = Get-UploadSessionNextOffset -Body $result.Body
+    }
+
+    return @{
+        Body           = $result.Body
+        StatusCode     = $result.StatusCode
+        Headers        = $result.Headers
+        IsNetworkError = $result.IsNetworkError
+        NextOffset     = $nextOffset
+    }
+}
+
+function Remove-UploadSession {
+    param([string]$UploadUrl)
+
+    if (-not $UploadUrl) { return }
+    $null = Invoke-UploadSessionRequest -Uri $UploadUrl -Method 'DELETE'
+}
+
+###############################################################################
 # Upload - large files (>= 4 MB): chunked upload session
 ###############################################################################
 function Send-LargeFile {
@@ -531,9 +633,9 @@ function Send-LargeFile {
     $encoded  = Get-EncodedPath $RemotePath
 
     # Create upload session (with retries + exponential backoff)
-    $uploadUrl       = ''
-    $sessionAttempt  = 0
-    $sessionBackoff  = $INITIAL_BACKOFF
+    $uploadUrl      = ''
+    $sessionAttempt = 0
+    $sessionBackoff = $INITIAL_BACKOFF
 
     while ($true) {
         $result = Invoke-GraphRequest `
@@ -568,7 +670,7 @@ function Send-LargeFile {
     # Upload in chunks
     $offset      = [long]0
     $chunkIdx    = 0
-    $totalChunks = [math]::Ceiling($fileSize / $script:ChunkSize)
+    $totalChunks = [math]::Ceiling(([double]$fileSize) / ([double]$script:ChunkSize))
     $fs          = $null
 
     try {
@@ -576,71 +678,148 @@ function Send-LargeFile {
 
         while ($offset -lt $fileSize) {
             $remaining = $fileSize - $offset
-            $thisChunk = [math]::Min($remaining, $script:ChunkSize)
-            $end       = $offset + $thisChunk - 1
+            if ($remaining -lt $script:ChunkSize) {
+                $thisChunk = [long]$remaining
+            } else {
+                $thisChunk = [long]$script:ChunkSize
+            }
+            $end = $offset + $thisChunk - 1
             $chunkIdx++
 
             Write-Log "  Chunk ${chunkIdx}/${totalChunks}: bytes ${offset}-${end}/${fileSize}"
 
             # Read chunk into byte array
-            $buffer = [byte[]]::new($thisChunk)
-            $null   = $fs.Seek($offset, [System.IO.SeekOrigin]::Begin)
+            $buffer = [byte[]]::new([int]$thisChunk)
+            $null = $fs.Seek($offset, [System.IO.SeekOrigin]::Begin)
             $bytesRead = 0
             while ($bytesRead -lt $thisChunk) {
-                $n = $fs.Read($buffer, $bytesRead, $thisChunk - $bytesRead)
+                $n = $fs.Read($buffer, $bytesRead, [int]($thisChunk - $bytesRead))
                 if ($n -eq 0) { break }
                 $bytesRead += $n
+            }
+            if ($bytesRead -ne $thisChunk) {
+                Remove-UploadSession $uploadUrl
+                Write-Err "Failed to read chunk data at offset $offset of $RemotePath"
+                return $false
             }
 
             $chunkAttempt  = 0
             $chunkBackoff  = $INITIAL_BACKOFF
+            $chunkComplete = $false
 
-            while ($true) {
-                $chunkStatusCode = 0
-                try {
-                    $chunkHeaders = @{
-                        'Content-Range' = "bytes ${offset}-${end}/${fileSize}"
+            while (-not $chunkComplete) {
+                $chunkHeaders = @{
+                    'Content-Length' = [string]$thisChunk
+                    'Content-Range'  = "bytes ${offset}-${end}/${fileSize}"
+                }
+                $chunkResult = Invoke-UploadSessionRequest -Uri $uploadUrl -Method 'PUT' `
+                    -Headers $chunkHeaders -ContentType 'application/octet-stream' -Body $buffer
+
+                if ($chunkResult.IsNetworkError) {
+                    $status = Get-UploadSessionStatus $uploadUrl
+                    if ($null -ne $status.NextOffset -and $status.NextOffset -gt $offset) {
+                        Write-Warn "Recovered upload session state after interrupted chunk; resuming from byte $($status.NextOffset)"
+                        $offset = [long]$status.NextOffset
+                        $chunkComplete = $true
+                        continue
                     }
-                    $chunkResp = Invoke-WebRequest -Uri $uploadUrl -Method PUT `
-                        -Headers $chunkHeaders `
-                        -ContentType 'application/octet-stream' `
-                        -Body $buffer `
-                        -UseBasicParsing -ErrorAction Stop
-                    $chunkStatusCode = [int]$chunkResp.StatusCode
-                } catch {
-                    $ex = $_.Exception
-                    if ($ex.PSObject.Properties['Response'] -and $ex.Response) {
-                        $chunkStatusCode = [int]$ex.Response.StatusCode
-                    } else {
-                        # Network error — cancel session and fail
-                        try { Invoke-WebRequest -Uri $uploadUrl -Method DELETE -UseBasicParsing -ErrorAction SilentlyContinue | Out-Null } catch {}
-                        Write-Err "Chunk upload failed (network error) at offset $offset of $RemotePath"
+
+                    $chunkAttempt++
+                    if ($chunkAttempt -gt $MAX_RETRIES) {
+                        Remove-UploadSession $uploadUrl
+                        Write-Err "Chunk upload failed (network error) after $MAX_RETRIES retries at offset $offset of $RemotePath"
                         return $false
                     }
+
+                    Write-Warn "Chunk upload interrupted, waiting ${chunkBackoff}s before retry $chunkAttempt/$MAX_RETRIES..."
+                    Start-Sleep -Seconds $chunkBackoff
+                    $chunkBackoff = $chunkBackoff * 2
+                    if ($chunkBackoff -gt $MAX_BACKOFF) { $chunkBackoff = $MAX_BACKOFF }
+                    continue
                 }
 
-                switch ($chunkStatusCode) {
-                    { $_ -eq 200 -or $_ -eq 201 -or $_ -eq 202 } { break }
-                    { $_ -eq 429 -or $_ -eq 503 } {
+                switch ($chunkResult.StatusCode) {
+                    { $_ -eq 200 -or $_ -eq 201 } {
+                        $offset = $end + 1
+                        $chunkComplete = $true
+                        break
+                    }
+                    202 {
+                        $nextOffset = Get-UploadSessionNextOffset -Body $chunkResult.Body
+                        if ($null -eq $nextOffset) {
+                            $offset = $end + 1
+                        } elseif ($nextOffset -le $offset) {
+                            $status = Get-UploadSessionStatus $uploadUrl
+                            if ($null -ne $status.NextOffset -and $status.NextOffset -gt $offset) {
+                                $offset = [long]$status.NextOffset
+                            } else {
+                                Remove-UploadSession $uploadUrl
+                                Write-Err "Upload session returned an invalid nextExpectedRanges value at offset $offset of $RemotePath"
+                                return $false
+                            }
+                        } else {
+                            $offset = [long]$nextOffset
+                        }
+                        $chunkComplete = $true
+                        break
+                    }
+                    416 {
+                        $status = Get-UploadSessionStatus $uploadUrl
+                        if ($null -ne $status.NextOffset -and $status.NextOffset -gt $offset) {
+                            Write-Warn "Upload session already advanced to byte $($status.NextOffset); resynchronizing chunk upload state"
+                            $offset = [long]$status.NextOffset
+                            $chunkComplete = $true
+                            break
+                        }
+
+                        $detail = Get-GraphErrorDetail $chunkResult.Body
+                        Remove-UploadSession $uploadUrl
+                        Write-Err "Chunk range rejected (HTTP 416) at offset $offset of $RemotePath - $detail"
+                        return $false
+                    }
+                    404 {
+                        Write-Err "Upload session expired or was not found while uploading $RemotePath"
+                        return $false
+                    }
+                    { $_ -eq 429 -or $_ -eq 500 -or $_ -eq 502 -or $_ -eq 503 -or $_ -eq 504 } {
+                        $status = Get-UploadSessionStatus $uploadUrl
+                        if ($null -ne $status.NextOffset -and $status.NextOffset -gt $offset) {
+                            Write-Warn "Upload session already advanced to byte $($status.NextOffset); resuming from reported server offset"
+                            $offset = [long]$status.NextOffset
+                            $chunkComplete = $true
+                            break
+                        }
+
                         $chunkAttempt++
                         if ($chunkAttempt -gt $MAX_RETRIES) {
-                            try { Invoke-WebRequest -Uri $uploadUrl -Method DELETE -UseBasicParsing -ErrorAction SilentlyContinue | Out-Null } catch {}
-                            Stop-WithError "Chunk throttled (HTTP $chunkStatusCode) after $MAX_RETRIES retries at offset $offset of $RemotePath - aborting. Re-run to resume."
+                            $detail = Get-GraphErrorDetail $chunkResult.Body
+                            Remove-UploadSession $uploadUrl
+                            Stop-WithError "Chunk upload failed persistently (HTTP $($chunkResult.StatusCode)) after $MAX_RETRIES retries at offset $offset of $RemotePath - aborting. Detail: $detail"
                         }
-                        Write-Warn "Chunk throttled (HTTP $chunkStatusCode), waiting ${chunkBackoff}s before retry $chunkAttempt/$MAX_RETRIES..."
-                        Start-Sleep -Seconds $chunkBackoff
+
+                        $waitTime = $chunkBackoff
+                        $retryAfter = $null
+                        if ($chunkResult.Headers.ContainsKey('Retry-After')) {
+                            $retryAfter = $chunkResult.Headers['Retry-After']
+                        }
+                        if ($retryAfter -match '^\d+$') {
+                            $waitTime = [int]$retryAfter
+                        }
+
+                        Write-Warn "Chunk upload transient failure (HTTP $($chunkResult.StatusCode)), waiting ${waitTime}s before retry $chunkAttempt/$MAX_RETRIES..."
+                        Start-Sleep -Seconds $waitTime
                         $chunkBackoff = $chunkBackoff * 2
                         if ($chunkBackoff -gt $MAX_BACKOFF) { $chunkBackoff = $MAX_BACKOFF }
+                        continue
                     }
                     default {
-                        Write-Err "Chunk upload failed (HTTP $chunkStatusCode) at offset $offset of $RemotePath"
-                        try { Invoke-WebRequest -Uri $uploadUrl -Method DELETE -UseBasicParsing -ErrorAction SilentlyContinue | Out-Null } catch {}
+                        $detail = Get-GraphErrorDetail $chunkResult.Body
+                        Remove-UploadSession $uploadUrl
+                        Write-Err "Chunk upload failed (HTTP $($chunkResult.StatusCode)) at offset $offset of $RemotePath - $detail"
                         return $false
                     }
                 }
             }
-
-            $offset += $thisChunk
         }
     } finally {
         if ($fs) { $fs.Close() }
