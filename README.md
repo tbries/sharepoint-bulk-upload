@@ -19,8 +19,12 @@ own identity (browser sign-in, MFA supported).
   `Retry-After` header support; aborts gracefully after 5 retries
 - **Dry-run mode** — preview what would happen without touching SharePoint
 - Zero dependencies beyond Bash, Azure CLI, curl, and jq
+- **Windows native** — PowerShell port (`sp-upload.ps1`) runs on Windows with
+  no additional dependencies beyond Azure CLI
 
 ## Prerequisites
+
+### macOS / Linux (Bash)
 
 | Requirement | Install |
 |---|---|
@@ -29,7 +33,19 @@ own identity (browser sign-in, MFA supported).
 | jq | `brew install jq` or `apt install jq` |
 | curl | Pre-installed on macOS/Linux |
 
+### Windows (PowerShell)
+
+| Requirement | Install |
+|---|---|
+| PowerShell 5.1+ | Built-in on Windows 10/11 |
+| Azure CLI | `winget install -e --id Microsoft.AzureCLI` or [aka.ms/installazurecli](https://aka.ms/installazurecli) |
+
+> **Note:** The PowerShell version (`sp-upload.ps1`) uses built-in `Invoke-WebRequest`
+> and `ConvertFrom-Json`, so `curl` and `jq` are **not** required on Windows.
+
 ## Getting Started
+
+### macOS / Linux
 
 ```bash
 # 1. Sign in (opens browser, supports MFA)
@@ -42,7 +58,22 @@ az login
   --library "Shared Documents"
 ```
 
+### Windows (PowerShell)
+
+```powershell
+# 1. Sign in (opens browser, supports MFA)
+az login
+
+# 2. Run the upload
+.\sp-upload.ps1 `
+  --source .\my-local-folder `
+  --site-url https://contoso.sharepoint.com/sites/team-x `
+  --library "Shared Documents"
+```
+
 ## Usage
+
+### Bash (macOS / Linux)
 
 ```bash
 ./sp-upload.sh \
@@ -55,6 +86,22 @@ az login
   [--log <path>] \
   [--ledger <path>]
 ```
+
+### PowerShell (Windows)
+
+```powershell
+.\sp-upload.ps1 `
+  --source <path> `
+  --site-url <url> `
+  --library <name> `
+  [--remote-path <path>] `
+  [--chunk-size <bytes>] `
+  [--dry-run] `
+  [--log <path>] `
+  [--ledger <path>]
+```
+
+Both scripts accept the same flags and produce the same behavior.
 
 ### Options
 
@@ -138,9 +185,9 @@ Delete the ledger file to force a full re-upload.
 
 | Problem | Solution |
 |---|---|
-| `Azure CLI not found` | Install with `brew install azure-cli` |
+| `Azure CLI not found` | Install with `brew install azure-cli` (macOS) or `winget install Microsoft.AzureCLI` (Windows) |
 | `Not logged in` | Run `az login` — opens browser for sign-in |
-| `jq not found` | Install with `brew install jq` |
+| `jq not found` | Install with `brew install jq` or `apt install jq` (not needed for PowerShell version) |
 | `Library not found` | Check the exact library name (case-sensitive). The error message lists available libraries. |
 | Large file upload fails | Ensure stable network; the script uses chunked uploads (10 MiB default) and cancels the session on failure — re-run to retry. Consider `--chunk-size` to lower chunk size on flaky connections. |
 | Throttled (429/503) | The script retries up to 5 times with exponential backoff (5 s → 120 s) and honors `Retry-After` headers. If throttling persists, it aborts — re-run later to resume via ledger. |
