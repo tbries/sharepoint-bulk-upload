@@ -36,7 +36,8 @@ $script:SiteUrl         = ''
 $script:Library         = ''
 $script:RemotePath      = ''
 $script:ChunkSize       = 10 * 1024 * 1024    # default 10 MiB per chunk
-$script:DryRun          = $false
+$script:DryRun                = $false
+$script:SkipFolderCreation    = $false
 $script:LogFile         = ''
 $script:LedgerFile      = ''
 $script:AccessToken     = ''
@@ -105,6 +106,7 @@ Optional:
                         Min: 327680 (320 KiB), Max: 62914560 (60 MiB)
                         Must be a multiple of 327680 (320 KiB)
   --dry-run             Preview operations without executing
+  --skip-folder-creation  Skip creating remote folders (use when they already exist)
   --log <path>          Log file (default: .\sp-upload.log)
   --ledger <path>       Ledger file for resume tracking
                         (default: <source>\.sp-upload-ledger)
@@ -177,7 +179,8 @@ function Read-Arguments {
             '--library'     { $script:Library    = $RawArgs[++$i]; break }
             '--remote-path' { $script:RemotePath = $RawArgs[++$i]; break }
             '--chunk-size'  { $script:ChunkSize  = $RawArgs[++$i]; break }
-            '--dry-run'     { $script:DryRun     = $true;          break }
+            '--dry-run'              { $script:DryRun              = $true;          break }
+            '--skip-folder-creation' { $script:SkipFolderCreation = $true;          break }
             '--log'         { $script:LogFile    = $RawArgs[++$i]; break }
             '--ledger'      { $script:LedgerFile = $RawArgs[++$i]; break }
             { $_ -eq '-h' -or $_ -eq '--help' } { Show-Usage }
@@ -862,7 +865,7 @@ function Write-Progress-Info {
     if ($UploadSecs -gt 0 -and $UploadBytes -gt 0) {
         $throughput = [long]($UploadBytes / $UploadSecs)
         if ($throughput -gt 0 -and $bytesLeft -gt 0) {
-            $etaSecs = [int]($bytesLeft / $throughput)
+            $etaSecs = [long]($bytesLeft / $throughput)
             Write-Log "  ETA      : ~$(Get-HumanTime $etaSecs)"
         } elseif ($bytesLeft -eq 0) {
             Write-Log '  ETA      : done'
@@ -887,7 +890,9 @@ function Start-UploadAll {
     $basePath    = $script:RemotePath
 
     # Create --remote-path directories first
-    if ($basePath -and -not $script:DryRun) {
+    if ($script:SkipFolderCreation) {
+        Write-Warn 'Skipping folder creation (--skip-folder-creation set)'
+    } elseif ($basePath -and -not $script:DryRun) {
         Update-Token
         $parts       = $basePath -split '/'
         $cumulative  = ''
@@ -926,7 +931,9 @@ function Start-UploadAll {
             $remoteFolder = $relDirNorm
         }
 
-        if ($script:DryRun) {
+        if ($script:SkipFolderCreation) {
+            # folder creation skipped
+        } elseif ($script:DryRun) {
             Write-Log "[DRY-RUN] Would create folder: $remoteFolder"
         } else {
             Update-Token
