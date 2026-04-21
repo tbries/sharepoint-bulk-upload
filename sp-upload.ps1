@@ -318,7 +318,7 @@ function Invoke-GraphRequest {
             }
             if ($ContentType) { $params['ContentType'] = $ContentType }
             if ($Body)        { $params['Body']        = $Body }
-            if ($InFile)      { $params['InFile']      = $InFile }
+            if ($InFile)      { $params['Body']        = [System.IO.File]::ReadAllBytes($InFile) }
 
             $response        = Invoke-WebRequest @params
             $statusCode      = [int]$response.StatusCode
