@@ -344,7 +344,15 @@ function Invoke-GraphRequest {
                     $responseBody = $ex.Message
                 }
             } else {
-                throw
+                # Network-level error (connection closed, socket reset, etc.) — retry with backoff
+                $attempt++
+                if ($attempt -gt $MAX_RETRIES) {
+                    Stop-WithError "Network error after $MAX_RETRIES retries - aborting. Error: $($ex.Message). Re-run to resume."
+                }
+                Write-Warn "Network error (attempt $attempt/$MAX_RETRIES), waiting ${backoff}s before retry... ($($ex.Message))"
+                Start-Sleep -Seconds $backoff
+                $backoff = [math]::Min($backoff * 2, $MAX_BACKOFF)
+                continue
             }
         }
 
